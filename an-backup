@@ -1,0 +1,545 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use URI::Escape;
+use IO::Handle;
+use DBI;
+
+my $conf={
+	db		=>	{
+		user		=>	"digimer",
+		name		=>	"files",
+		pass		=>	"",
+	},
+	skip		=>	",/dev,/lost+found,/proc,/run,/sys,",
+	stats		=>	{
+		symlinks	=>	0,
+		files		=>	0,
+		directories	=>	0,
+		block_devices	=>	0,
+		sockets		=>	0,
+		pipes		=>	0,
+		char_devices	=>	0,
+	},
+	timing		=>	{
+		start		=>	time,
+	},
+	intervals	=>	{
+		dirs		=>	1000,
+		files		=>	10000,
+		'time'		=>	5,
+		last_dirs	=>	0,
+		last_files	=>	0,
+		next_time	=>	time,
+	},
+	path		=>	{
+		df		=>	"/bin/df",
+		cryptsetup	=>	"/sbin/cryptsetup",
+		blkid		=>	"/sbin/blkid",
+		lvm		=>	"/sbin/lvm",
+	},
+	devices		=>	{
+		df_block_size	=>	0,
+	}
+};
+$conf->{intervals}{next_time} += $conf->{intervals}{'time'};
+
+# Connect to the database.
+connect_to_db($conf);
+get_partitions($conf);
+show_devices($conf);
+
+die "testing...\n";
+
+scan_dir($conf, "/");
+my $end_time=(time-$conf->{timing}{start});
+print "Scanned; Dirs. [".commify($conf->{stats}{directories})."], Files: [".commify($conf->{stats}{files})."], Symlinks: [".commify($conf->{stats}{symlinks})."] in: [$end_time] seconds.\n";
+if ($end_time > 3)
+{
+	my $total_files=$conf->{stats}{directories} + $conf->{stats}{files} + $conf->{stats}{symlinks};
+	my $process_rate=$total_files / $end_time;
+	print "Process rate: [".commify($process_rate)."]\n";
+}
+
+exit(0);
+
+###############################################################################
+# Functions                                                                   #
+###############################################################################
+
+sub get_partitions
+{
+	my ($conf)=@_;
+	
+	print "Building partition list,\n";
+	
+	# Check; Standard partitions (inc. crypt), KVM, DRBD.
+	process_df($conf);
+	
+	# Call blkid to get some more info.
+	foreach my $dev (sort {$a cmp $b} keys %{$conf->{dev}})
+	{
+		process_blkid($conf, $dev);
+	}
+	
+	# Check for LVM.
+	process_lvm($conf);
+	
+	return(0);
+}
+
+sub process_lvm
+{
+	my ($conf)=@_;
+	
+	# If I can't find the LVM binary, assume LVM is not installed.
+	if (not -x $conf->{path}{lvm})
+	{
+		print "LVM does not appear to be installed.\n";
+		return (1);
+	}
+	
+	# Call pvscan - pvdisplay
+	process_lvm_pv($conf);
+	process_lvm_vg($conf);
+	process_lvm_lv($conf);
+	
+	#die "testing...\n";
+	
+	return (0);
+}
+
+sub process_lvm_lv
+{
+	my ($conf)=@_;
+	
+	my $lv="";
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{lvm} lvscan && $conf->{path}{lvm} lvdisplay";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		
+		$line=~s/^\s+//;
+		$line=~s/\s{2,}/#!#/;
+		$line=~s/\s+$//;
+		next if $line !~ /#!#/;
+		$line =~ s/^- //;
+		$line =~ s/^# /number /;
+		if ($line =~ /lv name#!#(.*)/)
+		{
+			$lv=$1;
+			next;
+		}
+		next if not $lv;
+		next if not $line;
+		#print "lv: [$lv] -> [$line]\n";
+		my ($var, $val)=split/#!#/, $line, 2;
+		die "Failed to parse: [$line] for variable and value as split on '#!#'.\n" if not $var;
+		$val="" if not defined $val;
+		#print "Parsing: [$lv]: [$var] -> [$val]\n";
+		$conf->{lvm}{lv}{$lv}{$var}=$val;
+	}
+	$fh->close();
+	
+	return (0);
+}
+
+sub process_lvm_vg
+{
+	my ($conf)=@_;
+	
+	my $vg="";
+	my $pv="";
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{lvm} vgscan && $conf->{path}{lvm} vgdisplay -v";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		
+		$line=~s/^\s+//;
+		$line=~s/\s{2,}/#!#/;
+		$line=~s/\s+$//;
+		next if $line !~ /#!#/;
+		$line =~ s/^- //;
+		if ($line =~ /vg name#!#(.*)/)
+		{
+			$vg=$1;
+			$pv="";
+			next;
+		}
+		if ($line =~ /pv name#!#(.*)/)
+		{
+			$pv=$1;
+			next;
+		}
+		next if not $vg;
+		next if not $line;
+		#print "line vg: [$vg] -> [$line]\n";
+		my ($var, $val)=split/#!#/, $line, 2;
+		die "Failed to parse: [$line] for variable and value as split on '#!#'.\n" if not $var;
+		$val="" if not defined $val;
+		if ($pv)
+		{
+			#print "Parsing: [$vg] on: [$pv]: [$var] -> [$val]\n";
+			$conf->{lvm}{vg}{$vg}{pv}{$pv}{$var}=$val;
+		}
+		else
+		{
+			#print "Parsing: [$vg]: [$var] -> [$val]\n";
+			$conf->{lvm}{vg}{$vg}{$var}=$val;
+		}
+	}
+	$fh->close();
+	
+	return (0);
+}
+
+sub process_lvm_pv
+{
+	my ($conf)=@_;
+	
+	my $dev="";
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{lvm} pvscan && $conf->{path}{lvm} pvdisplay";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		$line=~s/^\s+//;
+		$line=~s/\s{2,}/#!#/;
+		$line=~s/\s+$//;
+		next if $line !~ /#!#/;
+		next if $line =~ /^---/;
+		#print "lvm pvscan line: [$line]\n";
+		if ($line =~ /pv name#!#(.*)/)
+		{
+			$dev=$1;
+		}
+		next if not $dev;
+		next if not $line;
+		my ($var, $val)=split/#!#/, $line, 2;
+		die "Failed to parse: [$line] for variable and value as split on '#!#'.\n" if not $var;
+		$val="" if not defined $val;
+		
+		#print "Parsing: [$dev]: [$var] -> [$val]\n";
+		$conf->{dev}{$dev}{lvm}{pv}{$var}=$val;
+	}
+	$fh->close();
+	
+	return (0);
+}
+
+sub process_blkid
+{
+	my ($conf, $dev)=@_;
+	
+	my $data;
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{blkid} -p $dev";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=$_;
+		#print "line: [$line]\n";
+		$data=$line;
+	}
+	$fh->close();
+	
+	($conf->{dev}{$dev}{blkid}{uuid})              = lc($data) =~ /uuid="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{version})           = lc($data) =~ /version="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{type})              = lc($data) =~ /type="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{usage})             = lc($data) =~ /usage="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_scheme}) = lc($data) =~ /part_entry_scheme="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_type})   = lc($data) =~ /part_entry_type="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_number}) = lc($data) =~ /part_entry_number="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_offset}) = lc($data) =~ /part_entry_offset="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_size})   = lc($data) =~ /part_entry_size="(.*?)"/;
+	($conf->{dev}{$dev}{blkid}{part_entry_disk})   = lc($data) =~ /part_entry_disk="(.*?)"/;
+	
+	return(0);
+}
+
+sub process_df
+{
+	my ($conf)=@_;
+	
+	# If I see 'luks' in the device path, I will call
+	# 'cryptsetup status <dev>' to get it's backing device and status.
+	my $block_size=0;
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{df} -P";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=$_;
+		#print "df line: [$line]\n";
+		if (not $block_size)
+		{
+			# Get the block size from the first line.
+			($block_size)=(split, $line)[1];
+			if ($block_size !~ /^(\d+)-/)
+			{
+				die "Failed to read block size from: [$sc]\n";
+			}
+			$conf->{devices}{df_block_size}=$1;
+			#print "block_size: [$conf->{devices}{df_block_size}]\n";
+		}
+		next if $line !~ /^\//;
+		my ($dev, $blocks, $used, $free, $percent, $mount)=(split, $line);
+		if ($dev =~ /luks/)
+		{
+			my ($type, $cipher, $keysize, $device, $offset, $size, $mode)=parse_luks($conf, $dev);
+			#print "type: [$type], cipher: [$cipher], keysize: [$keysize], device: [$device], offset: [$offset], size: [$size], mode: [$mode]\n";
+			$conf->{dev}{$device}={
+				dev_type	=>	"luks",
+				mapper_dev	=>	$dev,
+				blocks_total	=>	$blocks,
+				blocks_used	=>	$used,
+				blocks_free	=>	$free,
+				percent_free	=>	$percent,
+				mount_path	=>	$mount,
+				luks		=>	{
+					type		=>	$type,
+					cipher		=>	$cipher,
+					keysize		=>	$keysize,
+					offset		=>	$offset,
+					size		=>	$size,
+					mode		=>	$mode,
+				},
+			};
+		}
+		else
+		{
+			$conf->{dev}{$dev}={
+				dev_type	=>	"direct",
+				blocks_total	=>	$blocks,
+				blocks_used	=>	$used,
+				blocks_free	=>	$free,
+				percent_free	=>	$percent,
+				mount_path	=>	$mount,
+			};
+		}
+	}
+	$fh->close();
+	
+	return (0);
+}
+
+sub parse_luks
+{
+	my ($conf, $dev)=@_;
+	
+	my $data;
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{cryptsetup} status $dev";
+	open($fh, "$sc 2>&1 |") or die "Failed to call: [$sc], error: $!\n";
+	while(<$fh>)
+	{
+		chomp;
+		my $line=$_;
+		next if $line =~ /^\//;
+		$data.=(split, $line)[1]."#!#";
+		#print "line: [$line]\n";
+	}
+	$fh->close();
+	#print "data: [$data]\n";
+
+	return (split/#!#/, $data);
+}
+
+sub scan_dir
+{
+	my ($conf, $dir)=@_;
+	
+	local (*DIR);
+	opendir (DIR, $dir);
+	while (my $file=readdir(DIR))
+	{
+		next if $file eq "." or $file eq "..";
+		
+		my $full_path="$dir/$file";
+		$full_path=~s/\/\//\//;
+		my $safe_path=uri_escape("$full_path");
+		next if ($conf->{skip} =~ /$safe_path/);
+		if (-l $full_path)
+		{
+			my @stat=lstat($full_path);
+			$conf->{stats}{symlinks}++;
+			$conf->{file}{$full_path}={
+				type	=>	"l",
+				dev	=>	$stat[0],
+				mode	=>	$stat[2],
+				uid	=>	$stat[4],
+				gid	=>	$stat[5],
+				size	=>	$stat[7],	# in bytes
+				mtime	=>	$stat[9],
+				blksize	=>	$stat[11],
+				blocks	=>	$stat[12],
+			};
+		}
+		elsif (-f $full_path)
+		{
+			my @stat=stat($full_path);
+			$conf->{stats}{files}++;
+			$conf->{file}{$full_path}={
+				type	=>	"f",
+				dev	=>	$stat[0],
+				mode	=>	$stat[2],
+				uid	=>	$stat[4],
+				gid	=>	$stat[5],
+				size	=>	$stat[7],	# in bytes
+				mtime	=>	$stat[9],
+				blksize	=>	$stat[11],
+				blocks	=>	$stat[12],
+			};
+		}
+		elsif (-d $full_path)
+		{
+			my @stat=stat($full_path);
+			$conf->{stats}{directories}++;
+			$conf->{file}{$full_path}={
+				type	=>	"d",
+				dev	=>	$stat[0],
+				mode	=>	$stat[2],
+				uid	=>	$stat[4],
+				gid	=>	$stat[5],
+				size	=>	$stat[7],	# in bytes
+				mtime	=>	$stat[9],
+				blksize	=>	$stat[11],
+				blocks	=>	$stat[12],
+			};
+			scan_dir($conf, "$full_path");
+		}
+		elsif (-b $full_path)
+		{
+			# Block device.
+			$conf->{stats}{block_devices}++;
+# 			$type="b";
+		}
+		elsif (-S $full_path)
+		{
+			# Socket
+			$conf->{stats}{sockets}++;
+# 			$type="S";
+		}
+		elsif (-p $full_path)
+		{
+			# Pipe
+			$conf->{stats}{pipes}++;
+# 			$type="p";
+		}
+		elsif (-c $full_path)
+		{
+			# Character device
+			$conf->{stats}{char_devices}++;
+# 			$type="c";
+		}
+		if (($conf->{stats}{directories} > ($conf->{intervals}{last_dirs}  + $conf->{intervals}{dirs})) ||
+		    ($conf->{stats}{files}       > ($conf->{intervals}{last_files} + $conf->{intervals}{files})))
+		{
+			$conf->{intervals}{last_dirs}  = $conf->{stats}{directories};
+			$conf->{intervals}{last_files} = $conf->{stats}{files};
+			if (time >= $conf->{intervals}{next_time})
+			{
+				$conf->{intervals}{next_time} += $conf->{intervals}{'time'}; 
+				print "Processed: [".commify($conf->{stats}{directories})."] directories and: [".commify($conf->{stats}{files})."] files in: [".(time - $conf->{timing}{start})."] seconds so far.\n";
+			}
+# 			print "$full_path; - type: [$conf->{file}{$full_path}{type}], mode: [$conf->{file}{$full_path}{mode}], UID: [$conf->{file}{$full_path}{uid}], GID: [$conf->{file}{$full_path}{gid}], Bytes: [$conf->{file}{$full_path}{size}], Modified: [$conf->{file}{$full_path}{mtime}]\n";
+		}
+	}
+	
+	return(0);
+}
+
+sub connect_to_db
+{
+	my ($conf)=@_;
+	
+	$conf->{handle}{db}=DBI->connect("DBI:Pg:dbname=$conf->{db}{name}", "$conf->{db}{user}", "$conf->{db}{pass}") or die "Failed to connect to: [$conf->{db}{name}] as: [$conf->{db}{user}]; error: $DBI::errstr\n";
+	
+	return(0);
+}
+
+sub commify
+{
+        local($_)=shift;
+
+        if (not defined $_) { return undef; }
+        1 while s/^(-?\d+)(\d{3})/$1,$2/;
+
+        return $_;
+}
+
+sub show_devices
+{
+	my ($conf)=@_;
+	
+	print "Block size: [$conf->{devices}{df_block_size} bytes] as reported by 'df'.\n";
+	foreach my $dev (sort {$a cmp $b} keys %{$conf->{dev}})
+	{
+		print "Device: [$dev]\n";
+		foreach my $key (sort {$a cmp $b} keys %{$conf->{dev}{$dev}})
+		{
+			next if (($key eq "blkid") || ($key eq "luks") || ($key eq "lvm"));
+			print "- Device: [$key]\t-> [$conf->{dev}{$dev}{$key}]\n";
+		}
+		if (exists $conf->{dev}{$dev}{blkid})
+		{
+			foreach my $blkid_key (sort {$a cmp $b} keys %{$conf->{dev}{$dev}{blkid}})
+			{
+				print "- blkid:  [$blkid_key]\t-> [$conf->{dev}{$dev}{blkid}{$blkid_key}]\n";
+			}
+		}
+		if (exists $conf->{dev}{$dev}{luks})
+		{
+			foreach my $luks_key (sort {$a cmp $b} keys %{$conf->{dev}{$dev}{luks}})
+			{
+				print "- LUKS:   [$luks_key]\t-> [$conf->{dev}{$dev}{luks}{$luks_key}]\n";
+			}
+		}
+		if (exists $conf->{dev}{$dev}{lvm})
+		{
+			foreach my $lvm_key (sort {$a cmp $b} keys %{$conf->{dev}{$dev}{lvm}{pv}})
+			{
+				print "- LVM:    [$lvm_key]\t-> [$conf->{dev}{$dev}{lvm}{pv}{$lvm_key}]\n";
+			}
+		}
+	}
+	print "LVM\n";
+	foreach my $vg (sort {$a cmp $b} keys %{$conf->{lvm}{vg}})
+	{
+		print "- VG: [$vg]\n";
+		foreach my $var (sort {$a cmp $b} keys %{$conf->{lvm}{vg}{$vg}})
+		{
+			next if ($var eq "pv");
+			print "  - var: [$var] -> [$conf->{lvm}{vg}{$vg}{$var}]\n";
+		}
+		foreach my $pv (sort {$a cmp $b} keys %{$conf->{lvm}{vg}{$vg}{pv}})
+		{
+			print "  - pv:  [$pv]\n";
+			foreach my $var (sort {$a cmp $b} keys %{$conf->{lvm}{vg}{$vg}{pv}{$pv}})
+			{
+				print "    - var: [$var] -> [$conf->{lvm}{vg}{$vg}{pv}{$pv}{$var}]\n";
+			}
+		}
+	}
+	foreach my $lv (sort {$a cmp $b} keys %{$conf->{lvm}{lv}})
+	{
+		print "- LV: [$lv]\n";
+		foreach my $var (sort {$a cmp $b} keys %{$conf->{lvm}{lv}{$lv}})
+		{
+			print "  - var: [$var] -> [$conf->{lvm}{lv}{$lv}{$var}]\n";
+		}
+	}
+	
+	return(0);
+}
